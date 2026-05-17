@@ -1,0 +1,234 @@
+# Deploys the Data Flywheel stack via Docker Compose, waits for core services
+# to become healthy, then runs the shared DFW API automation from the QA image.
+#
+# Required repository secrets:
+#   NVIDIA_API_KEY        NVIDIA API key used by the blueprint services.
+#   NGC_API_KEY           NVIDIA API key used to pull nvcr.io images.
+#   MONGO_USERNAME        MongoDB root username.
+#   MONGO_PASSWORD        MongoDB root password.
+#   REDIS_PASSWORD        Redis password.
+#
+# Optional repository secrets:
+#   TEST_DOCKER_PULL_KEY  NVIDIA API key with pull access to the shared QA image.
+#                         If unset, NGC_API_KEY is used for the QA image pull.
+#   HF_TOKEN              Hugging Face token for optional model/data access.
+#   SMTP_USERNAME, SMTP_PASSWORD, SMTP_MAIL_TO, SMTP_MAIL_FROM
+
+name: Blueprint QA
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "deploy/**"
+      - "config/**"
+      - "tests/**"
+      - "notebooks/**"
+      - "scripts/**"
+      - "requirements.txt"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/blueprint-qa.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "deploy/**"
+      - "config/**"
+      - "tests/**"
+      - "notebooks/**"
+      - "scripts/**"
+      - "requirements.txt"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/blueprint-qa.yml"
+  workflow_dispatch:
+    inputs:
+      run_shared_qa:
+        description: "Run shared DFW API tests from the QA image"
+        required: false
+        default: true
+        type: boolean
+      keep_stack:
+        description: "Keep Docker Compose services running after the job"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  data-flywheel-api:
+    name: Data Flywheel API E2E
+    runs-on: arc-runner-set-oke-org-poc-5-gpu
+    timeout-minutes: 480
+    env:
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+      MONGO_USERNAME: ${{ secrets.MONGO_USERNAME }}
+      MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
+      REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      ES_COLLECTION_NAME: flywheel
+      TAG: "0.3.0"
+      COMPOSE_PROFILES: mlflow
+      REQUIRED_GPUS: "5"
+      DFW_API_URL: http://localhost:8000
+      QA_TEST_IMAGE: nvcr.io/rw983xdqtcdp/auto_test_team/blueprint-github-test-image:latest
+      TEST_REPORT_DIR: test_reports
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pre-flight checks
+        run: |
+          set -euo pipefail
+
+          missing=()
+          for secret_name in NVIDIA_API_KEY NGC_API_KEY MONGO_USERNAME MONGO_PASSWORD REDIS_PASSWORD; do
+            if [ -z "${!secret_name:-}" ]; then
+              missing+=("${secret_name}")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf 'Missing required secrets: %s\n' "${missing[*]}"
+            exit 1
+          fi
+
+          docker --version
+          docker compose version
+          docker info >/dev/null
+
+          available_gb=$(df -BG / | awk 'NR==2 {gsub("G", "", $4); print $4}')
+          if [ "${available_gb}" -lt 200 ]; then
+            echo "Need at least 200GB free disk, found ${available_gb}GB."
+            exit 1
+          fi
+
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi
+            gpu_count=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+          else
+            gpu_count=$(docker run --rm --gpus all nvidia/cuda:12.2.0-base-ubuntu22.04 \
+              nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+          fi
+          echo "Found ${gpu_count} GPU(s); required ${REQUIRED_GPUS}."
+          if [ "${gpu_count}" -lt "${REQUIRED_GPUS}" ]; then
+            exit 1
+          fi
+
+      - name: Create Docker Compose environment
+        run: |
+          set -euo pipefail
+          cat > deploy/.env <<EOF
+          MONGO_USERNAME=${MONGO_USERNAME}
+          MONGO_PASSWORD=${MONGO_PASSWORD}
+          REDIS_PASSWORD=${REDIS_PASSWORD}
+          NVIDIA_API_KEY=${NVIDIA_API_KEY}
+          NGC_API_KEY=${NGC_API_KEY}
+          LLM_JUDGE_API_KEY=${NVIDIA_API_KEY}
+          EMB_API_KEY=${NVIDIA_API_KEY}
+          HF_TOKEN=${HF_TOKEN}
+          ES_COLLECTION_NAME=${ES_COLLECTION_NAME}
+          TAG=${TAG}
+          COMPOSE_PROFILES=${COMPOSE_PROFILES}
+          EOF
+
+      - name: Deploy stack
+        run: |
+          set -euo pipefail
+          echo "${NGC_API_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+          docker compose --env-file deploy/.env -f deploy/docker-compose.yaml pull --ignore-pull-failures || true
+          docker compose --env-file deploy/.env -f deploy/docker-compose.yaml up -d --build
+
+      - name: Wait for stack health
+        run: |
+          set -euo pipefail
+          echo "Waiting for Data Flywheel API..."
+          timeout 900 bash -c 'until curl -fsS "${DFW_API_URL}/api/jobs" >/dev/null; do sleep 10; done'
+
+          curl -fsS "${DFW_API_URL}/docs" >/dev/null
+          curl -fsS "${DFW_API_URL}/openapi.json" >/dev/null
+          curl -fsS "http://localhost:9200/_cluster/health" >/dev/null
+
+          redis_container=$(docker ps -qf "name=redis" | head -1)
+          mongo_container=$(docker ps -qf "name=mongodb" | head -1)
+          test -n "${redis_container}"
+          test -n "${mongo_container}"
+          docker exec "${redis_container}" redis-cli -a "${REDIS_PASSWORD}" ping | grep -q PONG
+          docker exec "${mongo_container}" mongosh --eval 'db.runCommand("ping").ok' --quiet \
+            -u "${MONGO_USERNAME}" -p "${MONGO_PASSWORD}" | grep -q 1
+
+          docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+      - name: Run shared DFW API tests
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_shared_qa }}
+        env:
+          TEST_DOCKER_PULL_KEY: ${{ secrets.TEST_DOCKER_PULL_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${TEST_REPORT_DIR}"
+          pull_key="${TEST_DOCKER_PULL_KEY:-${NGC_API_KEY}}"
+          echo "${pull_key}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+          docker pull "${QA_TEST_IMAGE}"
+
+          docker run --rm --network host \
+            -v "$(pwd)/${TEST_REPORT_DIR}:/app/reports" \
+            -e DFW_API_URL="${DFW_API_URL}" \
+            "${QA_TEST_IMAGE}" \
+            pytest testcases/dfw/test_dfw_api.py \
+              -m dfw \
+              -k "not test_create_and_monitor_job_to_completion" \
+              --dfw-api-url "${DFW_API_URL}" \
+              --html=/app/reports/dfw-api-test.html \
+              --self-contained-html \
+              --disable-warnings \
+              -v
+
+      - name: Upload QA report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dfw-api-test-report
+          path: test_reports/*.html
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Cleanup
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || !inputs.keep_stack) }}
+        run: |
+          docker compose --env-file deploy/.env -f deploy/docker-compose.yaml down -v --rmi local 2>/dev/null || true
+          docker rmi "${QA_TEST_IMAGE}" 2>/dev/null || true
+          docker image prune -f
+
+      - name: Detect SMTP
+        id: smtp
+        if: always()
+        env:
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_MAIL_TO: ${{ secrets.SMTP_MAIL_TO }}
+          SMTP_MAIL_FROM: ${{ secrets.SMTP_MAIL_FROM }}
+        run: |
+          [ -n "${SMTP_USERNAME:-}" ] && [ -n "${SMTP_PASSWORD:-}" ] \
+            && [ -n "${SMTP_MAIL_TO:-}" ] && [ -n "${SMTP_MAIL_FROM:-}" ] \
+            && echo "enabled=true" >> "$GITHUB_OUTPUT" \
+            || echo "enabled=false" >> "$GITHUB_OUTPUT"
+
+      - name: Send mail
+        if: always() && steps.smtp.outputs.enabled == 'true'
+        uses: dawidd6/action-send-mail@6e71c855c9a091d80a519621b9fd3e8d252ca40c
+        continue-on-error: true
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "QA Test Workflow Result for ${{ github.repository }}"
+          to: ${{ secrets.SMTP_MAIL_TO }}
+          from: ${{ secrets.SMTP_MAIL_FROM }}
+          html_body: |
+            <p>Workflow for <strong>${{ github.repository }}</strong> finished: <strong>${{ job.status }}</strong></p>
+            <p><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View run</a></p>
