@@ -949,25 +949,53 @@ jobs:
           # See run 26095886415 for the prior failure where eval_size=
           # 100 against n=99 samples crashed the flywheel job.
 
+          # Why surgical regex instead of yaml.safe_dump round-trip:
+          # An earlier version of this step parsed the YAML with PyYAML and
+          # wrote it back with safe_dump. That reformatted the `nims:` block
+          # to PyYAML's default style (list items flush-left at column 0).
+          # Notebook cell 47 then runs a regex (?ms)^(nims:[\s\S]*?)(?=^\S|\Z)
+          # to swap the NIMs block. The negative lookahead matches the very
+          # first flush-left `- model_name:` line, so the replacement only
+          # consumes `nims:\n` and leaves the old list items as orphans
+          # below the new ones -> duplicate keys -> YAML ParserError when
+          # any later cell loads the config. (Seen in run 26097895803.)
+          #
+          # The fix is a surgical line-level substitution that only changes
+          # the two integers we care about. Every byte of formatting -
+          # indentation, blank lines, comments - is preserved as-is, so the
+          # cell 47 regex behaves exactly as it did against the original
+          # source file.
           python3 << 'PATCH_CFG'
-          import yaml
+          import re
 
           path = 'config/config.yaml'
           with open(path) as f:
-              cfg = yaml.safe_load(f)
+              text = f.read()
 
-          # Snapshot before
-          orig = dict(cfg.get('data_split_config', {}))
-          print(f"data_split_config (before): {orig}")
+          before = {}
+          for key in ('eval_size', 'min_total_records'):
+              m = re.search(rf'(?m)^\s*{key}:\s*(\d+)', text)
+              before[key] = m.group(1) if m else None
 
-          dsc = cfg.setdefault('data_split_config', {})
-          dsc['eval_size'] = 20
-          dsc['min_total_records'] = 30
+          text = re.sub(
+              r'(?m)^(\s*eval_size:\s*)\d+(\s*(?:#.*)?)$',
+              r'\g<1>20\g<2>',
+              text,
+          )
+          text = re.sub(
+              r'(?m)^(\s*min_total_records:\s*)\d+(\s*(?:#.*)?)$',
+              r'\g<1>30\g<2>',
+              text,
+          )
+
+          if 'eval_size: 20' not in text or 'min_total_records: 30' not in text:
+              raise SystemExit('config.yaml patch failed: target keys not rewritten')
 
           with open(path, 'w') as f:
-              yaml.safe_dump(cfg, f, sort_keys=False)
+              f.write(text)
 
-          print(f"data_split_config (after):  {cfg['data_split_config']}")
+          print(f"data_split_config.eval_size:         {before['eval_size']} -> 20")
+          print(f"data_split_config.min_total_records: {before['min_total_records']} -> 30")
           print("config.yaml patched for CI (source file in git is unchanged).")
           PATCH_CFG
 
