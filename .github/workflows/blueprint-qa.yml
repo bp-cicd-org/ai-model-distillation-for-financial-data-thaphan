@@ -146,12 +146,17 @@ jobs:
       - name: Wait for stack health
         run: |
           set -uo pipefail
+          # Curl defaults: force IPv4 (uvicorn binds 0.0.0.0 only — IPv6 ::1 is
+          # refused/RST and can confuse Happy Eyeballs), retry transient errors
+          # so a single TCP RST or connect-refused doesn't fail the whole step.
+          CURL_OPTS=(--ipv4 --retry 5 --retry-delay 2 --retry-all-errors --max-time 10)
+
           echo "Waiting for Data Flywheel API..."
           max_attempts=90
           attempt=0
           while true; do
             attempt=$((attempt + 1))
-            http_code=$(curl -o /dev/null -s -w '%{http_code}' "${DFW_API_URL}/api/jobs" || echo "000")
+            http_code=$(curl "${CURL_OPTS[@]}" -o /dev/null -s -w '%{http_code}' "${DFW_API_URL}/api/jobs" || echo "000")
             if [ "${http_code}" = "200" ]; then
               echo "API is up (HTTP ${http_code}) after ${attempt} attempts."
               break
@@ -166,9 +171,9 @@ jobs:
           done
 
           set -e
-          curl -fsS "${DFW_API_URL}/docs" >/dev/null
-          curl -fsS "${DFW_API_URL}/openapi.json" >/dev/null
-          curl -fsS "http://localhost:9200/_cluster/health" >/dev/null
+          curl "${CURL_OPTS[@]}" -fsS "${DFW_API_URL}/docs" >/dev/null
+          curl "${CURL_OPTS[@]}" -fsS "${DFW_API_URL}/openapi.json" >/dev/null
+          curl "${CURL_OPTS[@]}" -fsS "http://localhost:9200/_cluster/health" >/dev/null
 
           redis_container=$(docker ps -qf "name=redis" | head -1)
           mongo_container=$(docker ps -qf "name=mongodb" | head -1)
