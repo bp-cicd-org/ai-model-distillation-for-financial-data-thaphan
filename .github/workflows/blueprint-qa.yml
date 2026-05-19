@@ -145,10 +145,27 @@ jobs:
 
       - name: Wait for stack health
         run: |
-          set -euo pipefail
+          set -uo pipefail
           echo "Waiting for Data Flywheel API..."
-          timeout 900 bash -c 'until curl -fsS "${DFW_API_URL}/api/jobs" >/dev/null; do sleep 10; done'
+          max_attempts=90
+          attempt=0
+          while true; do
+            attempt=$((attempt + 1))
+            http_code=$(curl -o /dev/null -s -w '%{http_code}' "${DFW_API_URL}/api/jobs" || echo "000")
+            if [ "${http_code}" = "200" ]; then
+              echo "API is up (HTTP ${http_code}) after ${attempt} attempts."
+              break
+            fi
+            if [ "${attempt}" -ge "${max_attempts}" ]; then
+              echo "API did not become ready after $((max_attempts * 10))s. Last HTTP: ${http_code}"
+              docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" || true
+              exit 1
+            fi
+            echo "Attempt ${attempt}/${max_attempts}: API not ready (HTTP ${http_code}), retrying in 10s..."
+            sleep 10
+          done
 
+          set -e
           curl -fsS "${DFW_API_URL}/docs" >/dev/null
           curl -fsS "${DFW_API_URL}/openapi.json" >/dev/null
           curl -fsS "http://localhost:9200/_cluster/health" >/dev/null
@@ -162,6 +179,29 @@ jobs:
             -u "${MONGO_USERNAME}" -p "${MONGO_PASSWORD}" | grep -q 1
 
           docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          set +e
+          echo "================ docker ps -a ================"
+          docker ps -a
+          echo "================ docker compose ps ================"
+          docker compose --env-file deploy/.env -f deploy/docker-compose.yaml ps -a
+          echo "================ host listening on :8000 ================"
+          (ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null) | grep ':8000' || echo "(nothing listening on :8000)"
+          echo "================ curl -v /api/jobs ================"
+          curl -v --max-time 5 "${DFW_API_URL}/api/jobs" 2>&1 | head -40
+          for svc in api celery_worker celery_parent_worker mongodb redis elasticsearch mlflow; do
+            echo "================ logs: ${svc} ================"
+            docker compose --env-file deploy/.env -f deploy/docker-compose.yaml logs --tail=300 --no-color "${svc}" 2>&1 | tail -300
+          done
+          echo "================ inspect api ================"
+          docker compose --env-file deploy/.env -f deploy/docker-compose.yaml ps --format json api | head -50 || true
+          api_cid=$(docker ps -aqf "name=api" | head -1)
+          if [ -n "${api_cid}" ]; then
+            docker inspect --format '{{json .State}}' "${api_cid}" | python3 -m json.tool || true
+          fi
 
       - name: Run shared DFW API tests
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_shared_qa }}
