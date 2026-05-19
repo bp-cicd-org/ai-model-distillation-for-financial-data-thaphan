@@ -1004,6 +1004,19 @@ jobs:
           # customized model that downstream cells (89-103) can read.
           # See run 26095886415 for the prior failure where eval_size=
           # 100 against n=99 samples crashed the flywheel job.
+          #
+          # We also lower training_config.batch_size from 64 to 8. The
+          # customizer's NeMo trainer enforces global_batch_size <= number
+          # of validation samples, and with the CI 200-sample dataset the
+          # post-split val_size lands at ~18 (val_ratio=0.1 of train,
+          # minus stratification rounding). 64 > 18 made the customizer
+          # abort with "Batch size 64 cannot be larger than number of
+          # samples for validation 18" (run 26110670947 customizer log),
+          # which left ft_model_name pointing at a job that never
+          # produced an adapter; cell 98's inference call then hit a
+          # KeyError: 'choices' because the NIM responded with an error
+          # body. 8 is a comfortable power of two below the val floor
+          # and matches the typical CI-smoke batch size for LoRA SFT.
 
           # Why surgical regex instead of yaml.safe_dump round-trip:
           # An earlier version of this step parsed the YAML with PyYAML and
@@ -1029,7 +1042,7 @@ jobs:
               text = f.read()
 
           before = {}
-          for key in ('eval_size', 'min_total_records'):
+          for key in ('eval_size', 'min_total_records', 'batch_size'):
               m = re.search(rf'(?m)^\s*{key}:\s*(\d+)', text)
               before[key] = m.group(1) if m else None
 
@@ -1043,8 +1056,23 @@ jobs:
               r'\g<1>30\g<2>',
               text,
           )
+          # training_config.batch_size: 64 -> 8.
+          # `batch_size` only appears once at top-level under training_config
+          # in this file (the LoRA / data_split blocks use other key names),
+          # so a single line-anchored substitution is unambiguous and keeps
+          # the same surgical, formatting-preserving style as the two patches
+          # above.
+          text = re.sub(
+              r'(?m)^(\s*batch_size:\s*)\d+(\s*(?:#.*)?)$',
+              r'\g<1>8\g<2>',
+              text,
+          )
 
-          if 'eval_size: 20' not in text or 'min_total_records: 30' not in text:
+          if (
+              'eval_size: 20' not in text
+              or 'min_total_records: 30' not in text
+              or 'batch_size: 8' not in text
+          ):
               raise SystemExit('config.yaml patch failed: target keys not rewritten')
 
           with open(path, 'w') as f:
@@ -1052,6 +1080,7 @@ jobs:
 
           print(f"data_split_config.eval_size:         {before['eval_size']} -> 20")
           print(f"data_split_config.min_total_records: {before['min_total_records']} -> 30")
+          print(f"training_config.batch_size:          {before['batch_size']} -> 8")
           print("config.yaml patched for CI (source file in git is unchanged).")
           PATCH_CFG
 
