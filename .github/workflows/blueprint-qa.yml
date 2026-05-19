@@ -713,12 +713,21 @@ jobs:
           # classifies every headline in the dataset via the 70B teacher
           # NIM. On a single-node Minikube with 5 GPUs that exceeds the
           # 3600s per-cell timeout. For CI we want a smoke test of the
-          # label-gen pipeline, not a full production run, so we cap at
-          # 100 samples (~30s wall time vs >1h for full dataset).
+          # label-gen pipeline, not a full production run, so we cap.
+          #
+          # 200 (not 100) is chosen because the downstream flywheel job
+          # splits the labeled set into eval+val+train using config/
+          # config.yaml's data_split_config. sklearn's train_test_split
+          # requires test_size < n_samples; with eval_size=100 (after
+          # the runtime patch we drop to 20 in the workflow step
+          # "Patch config.yaml for CI Environment") and stratification
+          # dropping ~1 sample per rare class, 200 leaves enough
+          # headroom for meaningful fine-tune (~160 train samples).
+          # See run 26095886415 for the prior failure with 100 samples.
           cell30_src = ''.join(nb['cells'][30]['source'])
           nb['cells'][30]['source'] = [
               cell30_src.replace('num_samples=None, concurrent=200',
-                                 'num_samples=100, concurrent=200')
+                                 'num_samples=200, concurrent=200')
           ]
 
           # Cell 98: Bound the post-fine-tune sanity check for CI.
@@ -922,6 +931,46 @@ jobs:
       # cleanup was incomplete (crash, timeout, cancellation), orphaned
       # minikube containers/networks will conflict with the new run.
       # =====================================================================
+      - name: Patch config.yaml for CI Environment
+        run: |
+          # Same pattern as the deploy-nmp.sh patch above: the dev team's
+          # config/config.yaml in the repo is untouched in git. We mutate
+          # the checked-out copy on the runner only for this workflow run.
+          #
+          # Why: config/config.yaml ships with eval_size=100 (production
+          # default). The Preprocess Notebook for CI step caps teacher-
+          # model label generation at 200 samples (cell 30); the flywheel
+          # then asks sklearn.train_test_split for test_size=100 from
+          # ~199 stratified samples. That works, but leaves very little
+          # for training (~80 train samples). Lowering eval_size to 20
+          # rebalances the split to ~160 train / 18 val / 20 eval, which
+          # is the minimum for the LoRA fine-tune step to produce a
+          # customized model that downstream cells (89-103) can read.
+          # See run 26095886415 for the prior failure where eval_size=
+          # 100 against n=99 samples crashed the flywheel job.
+
+          python3 << 'PATCH_CFG'
+          import yaml
+
+          path = 'config/config.yaml'
+          with open(path) as f:
+              cfg = yaml.safe_load(f)
+
+          # Snapshot before
+          orig = dict(cfg.get('data_split_config', {}))
+          print(f"data_split_config (before): {orig}")
+
+          dsc = cfg.setdefault('data_split_config', {})
+          dsc['eval_size'] = 20
+          dsc['min_total_records'] = 30
+
+          with open(path, 'w') as f:
+              yaml.safe_dump(cfg, f, sort_keys=False)
+
+          print(f"data_split_config (after):  {cfg['data_split_config']}")
+          print("config.yaml patched for CI (source file in git is unchanged).")
+          PATCH_CFG
+
       - name: Pre-Cleanup Stale Docker Resources
         run: |
           echo "Cleaning up stale Docker resources from prior runs..."
