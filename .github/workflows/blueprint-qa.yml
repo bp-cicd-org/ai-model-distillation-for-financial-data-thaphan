@@ -112,6 +112,17 @@
 # command after Helm install to correct the image reference before
 # wait_for_pods runs.
 #
+# Patch 4 (Docker Hub rate-limit bypass): anonymous pulls from Docker Hub
+# made by the minikube container's kubelet are rate-limited (run
+# 26101017909 failed on `volcanosh/vc-scheduler:v1.9.0` and
+# `bitnamilegacy/postgresql:17.2.0-debian-12-r1`). The host runner has a
+# separate egress IP, so a preceding workflow step pre-pulls these images
+# to the host docker. Patch 4 injects `minikube image load` calls right
+# after `minikube addons enable ingress` so the images are present in the
+# cluster's image store before `kubectl apply volcano-dev.yaml` and the
+# NeMo helm install reference them. Best-effort: host pulls can also fail,
+# in which case Patch 2's tolerance loop is the safety net.
+#
 # We preprocess (rewrite) these cells rather than skipping them, because
 # subsequent cells depend on the variables they define or the side effects
 # they produce (project_root, dependencies, NGC_API_KEY, minikube cluster).
@@ -208,6 +219,9 @@
 # | 764-69 | helm install → sleep 20 → end func   | After sleep 20, kubectl set image  |
 # |        | (kube-rbac-proxy uses gcr.io which   | to fix kube-rbac-proxy image from  |
 # |        | was removed from GCR)                | gcr.io → registry.k8s.io           |
+# | ~570   | minikube addons enable ingress       | After ingress addon, minikube      |
+# |        | (next step would pull Docker Hub     | image load for host-prepulled      |
+# |        | images and hit anon rate-limit)      | volcanosh/* + bitnamilegacy images |
 #
 # =============================================================================
 
@@ -909,6 +923,47 @@ jobs:
               content = content.replace(old_sleep, new_sleep, 1)
               patches_applied.append("kube-rbac-proxy image fix (gcr.io → registry.k8s.io)")
 
+          # ── Patch 4: Load host-prepulled Docker Hub images into minikube ─
+          # The kubelet inside the minikube container has its own docker
+          # daemon and re-pulls every image from Docker Hub anonymously,
+          # which hits the rate limit (see run 26101017909). The host runner
+          # has separate egress, so the workflow's "Pre-pull Docker Hub
+          # Images" step pulled `volcanosh/*` and `bitnamilegacy/postgresql`
+          # to the host. Here we inject `minikube image load` right after
+          # `minikube addons enable ingress` so those images are present in
+          # the cluster's image store before `kubectl apply volcano-dev.yaml`
+          # and the NeMo helm install spin up pods that reference them.
+
+          old_ingress = (
+              '  log "Enabling ingress addon..."\n'
+              '  minikube addons enable ingress\n'
+          )
+          new_ingress = (
+              '  log "Enabling ingress addon..."\n'
+              '  minikube addons enable ingress\n'
+              '\n'
+              '  # CI-PATCH: Load host-prepulled Docker Hub images into minikube\n'
+              '  # to bypass anonymous Docker Hub rate-limiting from the minikube\n'
+              '  # container. Best-effort: if the host pull failed earlier, the\n'
+              '  # kubelet will still try (and Patch 2 tolerates transient errors).\n'
+              '  for _ci_img in \\\n'
+              '    volcanosh/vc-scheduler:v1.9.0 \\\n'
+              '    volcanosh/vc-controller-manager:v1.9.0 \\\n'
+              '    volcanosh/vc-webhook-manager:v1.9.0 \\\n'
+              '    bitnamilegacy/postgresql:17.2.0-debian-12-r1; do\n'
+              '    if docker image inspect "$_ci_img" >/dev/null 2>&1; then\n'
+              '      log "CI: loading $_ci_img into minikube..."\n'
+              '      minikube image load "$_ci_img" \\\n'
+              '        || warn "CI: minikube image load failed for $_ci_img"\n'
+              '    else\n'
+              '      warn "CI: $_ci_img not on host (pre-pull may have failed)"\n'
+              '    fi\n'
+              '  done\n'
+          )
+          if old_ingress in content:
+              content = content.replace(old_ingress, new_ingress, 1)
+              patches_applied.append("minikube image load (Docker Hub rate-limit bypass)")
+
           with open('scripts/deploy-nmp.sh', 'w') as f:
               f.write(content)
 
@@ -924,6 +979,7 @@ jobs:
           grep -cn "pidof systemd" "$SCRIPT" | xargs -I{} echo "  ✓ systemd guard: {} match(es)"
           grep -cn "_CI_IMGPULL_MAX" "$SCRIPT" | xargs -I{} echo "  ✓ ImagePull tolerance: {} match(es)"
           grep -cn "registry.k8s.io/kubebuilder" "$SCRIPT" | xargs -I{} echo "  ✓ kube-rbac-proxy fix: {} match(es)"
+          grep -cn "CI: loading" "$SCRIPT" | xargs -I{} echo "  ✓ minikube image load: {} match(es)"
 
       # =====================================================================
       # Phase 3.5: Pre-Cleanup — Remove stale containers from prior runs
@@ -998,6 +1054,65 @@ jobs:
           print(f"data_split_config.min_total_records: {before['min_total_records']} -> 30")
           print("config.yaml patched for CI (source file in git is unchanged).")
           PATCH_CFG
+
+      # =====================================================================
+      # Phase 3.6: Pre-pull Docker Hub images (rate-limit mitigation)
+      # =====================================================================
+      # Docker Hub aggressively rate-limits unauthenticated pulls. The pulls
+      # that bite us in CI are made from INSIDE the minikube container (whose
+      # docker daemon is separate from the host's). When the rate limit hits,
+      # `volcano-scheduler` and the NeMo data-store `prepull-postgres-image`
+      # job loop on ImagePullBackOff for ~5 min and the notebook deploy step
+      # eventually gives up (see run 26101017909).
+      #
+      # We can't authenticate (no DOCKERHUB_TOKEN secret available), but the
+      # HOST runner usually sits behind a different egress IP than minikube,
+      # so it tends to have headroom while minikube is starved. We pull on
+      # the host with retries, then `minikube image load` them into the
+      # cluster's image store after `deploy-nmp.sh` calls `minikube start`
+      # (see Patch 4 in the deploy-nmp.sh patch step above).
+      #
+      # If a host pull also fails, we don't abort — `minikube image load`
+      # in the patched script is best-effort; the notebook will fall back to
+      # the existing ImagePull tolerance loop (Patch 2). At least one of
+      # the two layers usually succeeds, which is enough to unblock the run.
+      - name: Pre-pull Docker Hub Images (rate-limit mitigation)
+        run: |
+          echo "========================================"
+          echo "  PRE-PULL DOCKER HUB IMAGES"
+          echo "========================================"
+          IMAGES=(
+            "docker.io/volcanosh/vc-scheduler:v1.9.0"
+            "docker.io/volcanosh/vc-controller-manager:v1.9.0"
+            "docker.io/volcanosh/vc-webhook-manager:v1.9.0"
+            "docker.io/bitnamilegacy/postgresql:17.2.0-debian-12-r1"
+          )
+          for img in "${IMAGES[@]}"; do
+            short="${img#docker.io/}"
+            echo ""
+            echo "--- Pulling $short ---"
+            ok=0
+            for attempt in 1 2 3 4 5; do
+              if docker pull "$img" 2>&1 | tail -5; then
+                ok=1
+                # Tag the docker.io/... pull as the bare name so
+                # `minikube image load` can find it under the same ref the
+                # cluster manifests expect.
+                docker tag "$img" "$short" 2>/dev/null || true
+                echo "  OK on attempt $attempt"
+                break
+              fi
+              wait=$((attempt * 30))
+              echo "  attempt $attempt/5 failed — sleeping ${wait}s before retry"
+              sleep "$wait"
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "  WARN: could not pre-pull $short (in-cluster pull will retry via Patch 2 tolerance)"
+            fi
+          done
+          echo ""
+          echo "--- Pre-pulled images on host ---"
+          docker images | grep -E "volcanosh|bitnamilegacy" || echo "(none)"
 
       - name: Pre-Cleanup Stale Docker Resources
         run: |
