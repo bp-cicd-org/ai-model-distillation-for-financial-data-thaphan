@@ -110,7 +110,13 @@
 # references gcr.io/kubebuilder/kube-rbac-proxy:v0.15.0, which was removed
 # from GCR (migrated to registry.k8s.io). We inject a `kubectl set image`
 # command after Helm install to correct the image reference before
-# wait_for_pods runs.
+# wait_for_pods runs. Because `helm install` already spawned the original
+# (broken) pod that immediately enters ImagePullBackOff, the patch also
+# runs `kubectl rollout status` to wait for the rolling update and then
+# force-deletes any operator pod still stuck in a non-Running phase, so
+# deploy-nmp.sh's check_pod_health doesn't see the dead old pod and abort
+# (run 26115227627: new pod was Running 2/2 but the dying old pod still
+# tripped the "Base cluster is not healthy" check).
 #
 # Patch 4 (Docker Hub rate-limit bypass): anonymous pulls from Docker Hub
 # made by the minikube container's kubelet are rate-limited (run
@@ -916,6 +922,36 @@ jobs:
               '    kubectl set image deployment/nemo-nemo-operator-controller-manager \\\n'
               '      kube-rbac-proxy=registry.k8s.io/kubebuilder/kube-rbac-proxy:v0.15.0 \\\n'
               '      -n "$NAMESPACE" || warn "Could not patch kube-rbac-proxy image"\n'
+              '\n'
+              '    # CI-PATCH: wait for the rolling update to settle and clean up\n'
+              '    # the stale pod from the original (broken) ReplicaSet.\n'
+              '    # `helm install` already created a pod with the bad gcr.io image\n'
+              '    # that immediately enters ImagePullBackOff. The `set image` above\n'
+              '    # triggers a new ReplicaSet whose pod pulls the correct image and\n'
+              '    # becomes Ready. The Deployment controller eventually scales the\n'
+              '    # old RS to 0, but the dead pod can linger long enough for\n'
+              '    # deploy-nmp.sh\'s `check_pod_health` to see it and abort with\n'
+              '    # "Base cluster is not healthy" — even though the new pod is\n'
+              '    # already Running 2/2 (run 26115227627 reproduced this exactly).\n'
+              '    # We wait for the rollout to report success, then force-delete\n'
+              '    # any operator pods that are still in a non-Running phase so\n'
+              '    # the downstream health check only sees live pods.\n'
+              '    log "Waiting for nemo-operator rolling update to complete..."\n'
+              '    kubectl rollout status deployment/nemo-nemo-operator-controller-manager \\\n'
+              '      -n "$NAMESPACE" --timeout=300s \\\n'
+              '      || warn "Rollout did not finish within 300s; will force-clean stale pods"\n'
+              '\n'
+              '    stale_pods=$(kubectl get pods -n "$NAMESPACE" \\\n'
+              '      --field-selector=status.phase!=Running --no-headers 2>/dev/null \\\n'
+              '      | awk \'/^nemo-nemo-operator-controller-manager/ {print $1}\')\n'
+              '    if [[ -n "$stale_pods" ]]; then\n'
+              '      log "Force-deleting stale operator pods stuck on old image:"\n'
+              '      echo "$stale_pods" | while read -r _ci_p; do\n'
+              '        log "  $_ci_p"\n'
+              '        kubectl delete pod "$_ci_p" -n "$NAMESPACE" \\\n'
+              '          --force --grace-period=0 2>/dev/null || true\n'
+              '      done\n'
+              '    fi\n'
               '  fi\n'
               '}'
           )
@@ -979,6 +1015,7 @@ jobs:
           grep -cn "pidof systemd" "$SCRIPT" | xargs -I{} echo "  ✓ systemd guard: {} match(es)"
           grep -cn "_CI_IMGPULL_MAX" "$SCRIPT" | xargs -I{} echo "  ✓ ImagePull tolerance: {} match(es)"
           grep -cn "registry.k8s.io/kubebuilder" "$SCRIPT" | xargs -I{} echo "  ✓ kube-rbac-proxy fix: {} match(es)"
+          grep -cn "Waiting for nemo-operator rolling update" "$SCRIPT" | xargs -I{} echo "  ✓ rollout wait + stale-pod cleanup: {} match(es)"
           grep -cn "CI: loading" "$SCRIPT" | xargs -I{} echo "  ✓ minikube image load: {} match(es)"
 
       # =====================================================================
