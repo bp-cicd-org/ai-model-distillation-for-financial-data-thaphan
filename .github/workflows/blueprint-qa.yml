@@ -643,15 +643,28 @@ jobs:
           with open(nb_path) as f:
               nb = json.load(f)
 
-          # Cell 5: Fix project_root for CI.
-          # Original walks up parent dirs assuming Brev Launchable layout.
-          # In CI, notebook_runner CWD = repo root (after actions/checkout).
+          # Cell 5: Fix project_root for CI and preserve other variables
+          # that later cells depend on.
+          #
+          # Original cell 5 walks up parent dirs assuming the Brev Launchable
+          # layout (notebook_dir.parent / 'ai-model-distillation-for-financial-data').
+          # In CI, notebook_runner CWD = repo root (after actions/checkout), so
+          # project_root is just Path.cwd().
+          #
+          # IMPORTANT: original cell 5 also defines `data_dir = project_root /
+          # "data"` which is later referenced by cell 60. Earlier versions of
+          # this patch dropped that line, which surfaced as a NameError on
+          # cell 60 ("name 'data_dir' is not defined", run 26094142383). Keep
+          # data_dir here so downstream cells stay self-contained.
           nb['cells'][5]['source'] = [
               'from pathlib import Path\n',
               'import os\n',
               '\n',
               'project_root = Path.cwd()\n',
+              'data_dir = project_root / "data"\n',
+              'data_dir.mkdir(parents=True, exist_ok=True)\n',
               'print(f"Project root: {project_root}")\n',
+              'print(f"Data dir:     {data_dir}")\n',
           ]
 
           # Cell 7: Replace uv pip install with pip3 --break-system-packages.
