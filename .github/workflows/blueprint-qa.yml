@@ -1340,18 +1340,43 @@ jobs:
           echo "${pull_key}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
           docker pull "${QA_TEST_IMAGE}"
 
+          # AI-MDFD-scoped pytest only (markers T5550841-T5614424); see blueprint-github-test!191.
           docker run --rm --network host \
             -v "$(pwd)/${TEST_REPORT_DIR}:/app/reports" \
             -e DFW_API_URL="${DFW_API_URL}" \
             "${QA_TEST_IMAGE}" \
-            pytest testcases/dfw/test_dfw_api.py \
-              -m dfw \
-              -k "not test_create_and_monitor_job_to_completion" \
+            pytest \
+              testcases/ai_model_distillation/test_ai_model_distillation_api.py \
+              -m "ai_model_distillation and api" \
               --dfw-api-url "${DFW_API_URL}" \
               --html=/app/reports/dfw-api-test.html \
               --self-contained-html \
               --disable-warnings \
               -v
+
+      - name: Run AI-MDFD Unit Tests (T5614423)
+        if: success()
+        run: |
+          set -euo pipefail
+          pip install --break-system-packages -e .
+          mkdir -p "${TEST_REPORT_DIR}"
+          pytest tests/unit/lib/flywheel/test_util.py \
+            -m T5614423 \
+            --html="${TEST_REPORT_DIR}/ai-mdfd-unit-T5614423.html" \
+            --self-contained-html \
+            --disable-warnings \
+            -v
+
+      - name: Run AI-MDFD Worker SIGTERM Test (T5614424)
+        if: success()
+        run: |
+          set -euo pipefail
+          pytest tests/integration/test_worker_sigterm.py \
+            --override-ini="addopts=" \
+            --html="${TEST_REPORT_DIR}/ai-mdfd-integration-T5614424.html" \
+            --self-contained-html \
+            --disable-warnings \
+            -v
 
       - name: Upload QA Test Report
         uses: actions/upload-artifact@v4
